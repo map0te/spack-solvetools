@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spack_solvetools"
+description = "Extension providing solve visualization and profiling tools for Spack"
+version = "0.1.0"
+requires-python = ">=3.8"
+readme = "README.md"
+license = {text = "Apache-2.0 OR MIT"}
+
+[project.entry-points."spack.extensions"]
+spack_solvetools = "spack_solvetools:get_spack_extension_paths"
+
+[project.entry-points."spack.config"]
+spack_solvetools = "spack_solvetools:get_spack_config_dir"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"*" = ["**/*"]
