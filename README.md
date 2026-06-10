@@ -1,6 +1,6 @@
 # spack-solvetools
 
-A Spack extension providing solve visualization and profiling tools.
+A Spack extension providing solver tools.
 
 ## Installation
 
@@ -8,7 +8,7 @@ A Spack extension providing solve visualization and profiling tools.
 $ unset SPACK_PYTHON  # ensure Spack uses the Python from the virtual environment
 $ python3 -m venv .venv
 $ source .venv/bin/activate
-$ pip install "git+https://github.com/YOUR_USERNAME/spack-solvetools#egg=spack_solvetools"
+$ pip install "git+https://github.com/map0te/spack-solvetools#egg=spack_solvetools"
 ```
 
 ## Usage
