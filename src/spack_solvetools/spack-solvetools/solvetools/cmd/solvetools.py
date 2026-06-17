@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 import argparse
+import inspect
 import pprint
 import re
 import sys
@@ -24,6 +25,13 @@ import spack.package_base
 from spack.cmd.common.arguments import add_concretizer_args
 from spack.solver.asp import ErrorHandler, PyclingoDriver, Result, SpecBuilder, UnsatisfiableSpecError, build_criteria_names
 from spack.solver.core import extract_args
+
+# Try to import SolverPriorityConstants (available in level-opt branch)
+try:
+    from spack.solver.asp import SolverPriorityConstants
+    HAS_PRIO_CONSTANTS = True
+except ImportError:
+    HAS_PRIO_CONSTANTS = False
 
 
 level = "long"
@@ -135,7 +143,29 @@ def capturing_run_clingo(self, specs_arg, setup_arg, problem_str, control_file_p
 
     result.answers.append((list(min_cost), 0, spec_dict))
     criteria_args = extract_args(best_model, "opt_criterion")
-    result.criteria = build_criteria_names(min_cost, criteria_args)
+
+    # Check if build_criteria_names requires prio_constants (level-opt branch)
+    sig = inspect.signature(build_criteria_names)
+    if len(sig.parameters) >= 3 and HAS_PRIO_CONSTANTS:
+        # level-opt branch: build_criteria_names needs prio_constants
+        prio_constants = SolverPriorityConstants(
+            self.control.get_const("max_depth").number,
+            self.control.get_const("level_opt").number,
+            self.control.get_const("indep_opt").number,
+            self.control.get_const("low_offset").number,
+            self.control.get_const("concr_offset").number,
+            self.control.get_const("hinge_offset").number,
+            self.control.get_const("built_offset").number,
+            self.control.get_const("high_offset").number,
+            self.control.get_const("error_offset").number,
+            self.control.get_const("fixed_offset").number
+        )
+        result.criteria = build_criteria_names(min_cost, criteria_args, prio_constants)
+        result.prio_constants = prio_constants
+    else:
+        # develop branch: build_criteria_names takes only 2 parameters
+        result.criteria = build_criteria_names(min_cost, criteria_args)
+
     result.nmodels = len(models)
     result.possible_dependencies = setup_arg.pkgs
     timer.stop("construct_specs")
@@ -237,32 +267,187 @@ def _process_result(result, show, required_format, kwargs):
 
         print()
         maxlen = max(len(s.name) for s in result.criteria)
-        color.cprint("@*{  Priority  Value  Criterion}")
 
-        for i, criterion in enumerate(result.criteria, 1):
-            value = f"@K{{{criterion.value:>5}}}"
-            grey_out = True
-            if criterion.value > 0:
-                value = f"@*{{{criterion.value:>5}}}"
-                grey_out = False
+        # Check if we have prio_constants (new leveled format)
+        if hasattr(result, 'prio_constants') and result.prio_constants is not None:
+            pc = result.prio_constants
 
-            if grey_out:
-                lc = "@K"
-            elif criterion.kind == asp.OptimizationKind.CONCRETE:
-                lc = "@b"
-            elif criterion.kind == asp.OptimizationKind.BUILD:
-                lc = "@g"
-            else:
-                lc = "@y"
+            # Count how many times each (name, kind) pair appears to identify level-expanded criteria
+            criterion_counts = {}
+            for c in result.criteria:
+                key = (c.name, c.kind)
+                criterion_counts[key] = criterion_counts.get(key, 0) + 1
 
-            color.cprint(f"  @K{{{i:8}}}  {value}  {lc}{{{criterion.name:<{maxlen}}}}")
-        print()
-        print()
-        color.cprint("  @*{Legend:}")
-        color.cprint("    @g{Specs to be built}")
-        color.cprint("    @b{Reused specs}")
-        color.cprint("    @y{Other criteria}")
-        print()
+            def extract_level(priority, kind):
+                """Extract the level from a priority value for level-expanded criteria.
+                Note: fixed and level criteria share the same priority ranges, but
+                fixed criteria are only active at level 0, while level criteria
+                expand across all levels L0-L(max_depth-1).
+                """
+                # Level criteria can span from built_offset to built_offset + max_depth * level_opt
+                level_upper_bound_built = pc.built_offset + pc.max_depth * pc.level_opt
+                level_upper_bound_concr = pc.concr_offset + pc.max_depth * pc.level_opt
+
+                if kind == asp.OptimizationKind.BUILD:
+                    # Check if in level range
+                    if pc.built_offset <= priority < level_upper_bound_built:
+                        offset_from_level_start = priority - pc.built_offset
+                        return offset_from_level_start // pc.level_opt
+                elif kind == asp.OptimizationKind.CONCRETE:
+                    # Check if in level range
+                    if pc.concr_offset <= priority < level_upper_bound_concr:
+                        offset_from_level_start = priority - pc.concr_offset
+                        return offset_from_level_start // pc.level_opt
+                return None
+
+            sections = [
+                ("High Priority", lambda c: c.priority >= pc.high_offset),
+                ("Build Priority", lambda c: pc.built_offset <= c.priority < pc.high_offset),
+                ("Hinge Priority", lambda c: pc.hinge_offset <= c.priority < pc.built_offset),
+                ("Concrete/Reuse Priority", lambda c: pc.concr_offset <= c.priority < pc.hinge_offset),
+                ("Low Priority", lambda c: pc.low_offset <= c.priority < pc.concr_offset),
+            ]
+
+            for section_name, section_filter in sections:
+                # Collect all criteria in this section
+                section_criteria = []
+                for criterion in result.criteria:
+                    if section_filter(criterion):
+                        section_criteria.append(criterion)
+
+                if not section_criteria:
+                    continue
+
+                color.cprint(f"\n@*{{{section_name}:}}")
+
+                # Group criteria by (name, kind) for horizontal layout
+                criteria_groups = {}
+                for criterion in section_criteria:
+                    key = (criterion.name, criterion.kind)
+                    if key not in criteria_groups:
+                        criteria_groups[key] = []
+                    criteria_groups[key].append(criterion)
+
+                # Sort groups by highest priority in each group
+                sorted_groups = sorted(criteria_groups.items(),
+                                       key=lambda x: max(c.priority for c in x[1]),
+                                       reverse=True)
+
+                # Prepare rows data
+                rows = []
+                for key, group in sorted_groups:
+                    name, kind = key
+                    # Sort criteria in group by priority (highest first)
+                    group_sorted = sorted(group, key=lambda c: c.priority, reverse=True)
+
+                    # Get the highest priority for this group
+                    highest_priority = group_sorted[0].priority
+
+                    # Track previous value for de-accumulation
+                    prev_value = 0
+                    values_by_level = {}
+
+                    # Collect values by level
+                    for criterion in group_sorted:
+                        if len(group) > 1:  # Level-expanded
+                            internal_level = extract_level(criterion.priority, criterion.kind)
+                            if internal_level is not None:
+                                display_value = criterion.value - prev_value
+                                prev_value = criterion.value
+                                # Reverse level for display: internal max_depth-1 (roots) -> display L0
+                                display_level = pc.max_depth - 1 - internal_level
+                                values_by_level[display_level] = display_value
+                        else:  # Fixed criterion - always show in L0
+                            values_by_level[0] = criterion.value
+
+                    rows.append((highest_priority, values_by_level, name, kind))
+
+                # Build and print header (always use leveled format)
+                # Display levels in reverse order: L0 = roots (internally max_depth-1)
+                header_cols = ["Priority"] + [f"L{i}" for i in range(pc.max_depth)] + ["Criterion"]
+                col_widths = [8] + [6] * pc.max_depth + [maxlen]
+
+                # Right-align all headers except last (Criterion)
+                header_parts = [f"{col:>{w}}" for col, w in zip(header_cols[:-1], col_widths[:-1])]
+                header_parts.append(f"{header_cols[-1]:<{col_widths[-1]}}")
+                header = "  " + "  ".join(header_parts)
+                color.cprint("@*{" + header + "}")
+
+                # Print rows
+                for priority, values_by_level, name, kind in rows:
+                    # Build value columns
+                    value_cols = []
+                    for level in range(pc.max_depth):
+                        if level in values_by_level:
+                            value_cols.append((values_by_level[level], kind))
+                        else:
+                            value_cols.append((None, kind))
+
+                    # Format the row (right-align all values)
+                    row_parts = [f"  @K{{{priority:>8}}}"]
+
+                    for value, k in value_cols:
+                        if value is None:
+                            row_parts.append(f"  @K{{{'-':>6}}}")
+                        elif value > 0:
+                            if k == asp.OptimizationKind.CONCRETE:
+                                row_parts.append(f"  @b{{{value:>6}}}")
+                            elif k == asp.OptimizationKind.BUILD:
+                                row_parts.append(f"  @g{{{value:>6}}}")
+                            else:
+                                row_parts.append(f"  @y{{{value:>6}}}")
+                        else:
+                            row_parts.append(f"  @K{{{value:>6}}}")
+
+                    # Determine color for criterion name based on if any value > 0
+                    lc = "@K"
+                    if any(v > 0 for v in values_by_level.values() if v is not None):
+                        if kind == asp.OptimizationKind.CONCRETE:
+                            lc = "@b"
+                        elif kind == asp.OptimizationKind.BUILD:
+                            lc = "@g"
+                        else:
+                            lc = "@y"
+
+                    row_parts.append(f"  {lc}{{{name:<{maxlen}}}}")
+                    color.cprint("".join(row_parts))
+
+            print()
+            print()
+            color.cprint("  @*{Legend:}")
+            color.cprint("    @g{Specs to be built}")
+            color.cprint("    @b{Reused specs}")
+            color.cprint("    @y{Other criteria}")
+            print()
+
+        else:
+            # Fall back to old format if prio_constants not available
+            color.cprint("@*{  Priority  Value  Criterion}")
+
+            for i, criterion in enumerate(result.criteria, 1):
+                value = f"@K{{{criterion.value:>5}}}"
+                grey_out = True
+                if criterion.value > 0:
+                    value = f"@*{{{criterion.value:>5}}}"
+                    grey_out = False
+
+                if grey_out:
+                    lc = "@K"
+                elif criterion.kind == asp.OptimizationKind.CONCRETE:
+                    lc = "@b"
+                elif criterion.kind == asp.OptimizationKind.BUILD:
+                    lc = "@g"
+                else:
+                    lc = "@y"
+
+                color.cprint(f"  @K{{{i:8}}}  {value}  {lc}{{{criterion.name:<{maxlen}}}}")
+            print()
+            print()
+            color.cprint("  @*{Legend:}")
+            color.cprint("    @g{Specs to be built}")
+            color.cprint("    @b{Reused specs}")
+            color.cprint("    @y{Other criteria}")
+            print()
 
     if "solutions" in show:
         if required_format:
