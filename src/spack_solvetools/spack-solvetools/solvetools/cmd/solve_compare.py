@@ -225,13 +225,21 @@ def run(args):
     # Prepare inputs for parallel execution
     inputs = [(spec_str, use_fresh) for spec_str in spec_strs]
 
-    # Use spack's parallel execution
+    # Use spack's parallel execution with maxtaskperchild=1 to avoid hanging
+    if args.jobs > 1:
+        record_iterator = spack.util.parallel.imap_unordered(
+            _capture_solve_with_criteria,
+            inputs,
+            processes=args.jobs,
+            debug=tty.is_debug(),
+            maxtaskperchild=1,
+        )
+    else:
+        record_iterator = map(_capture_solve_with_criteria, inputs)
+
+    # Process results as they complete
     idx = 0
-    for output in spack.util.parallel.imap_unordered(
-        _capture_solve_with_criteria,
-        inputs,
-        processes=args.jobs,
-    ):
+    for output in record_iterator:
         idx += 1
         spec_str, criteria_data, dag_output, error = output
 
