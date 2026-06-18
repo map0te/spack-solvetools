@@ -2,7 +2,6 @@
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 import argparse
-import concurrent.futures
 import inspect
 import json
 import os
@@ -19,6 +18,7 @@ import spack.llnl.util.tty.color as color
 import spack.package_base
 import spack.solver.asp as asp
 import spack.spec
+import spack.util.parallel
 from spack.cmd.common.arguments import add_concretizer_args
 from spack.solver.asp import (
     ErrorHandler,
@@ -107,12 +107,13 @@ def setup_parser(subparser: argparse.ArgumentParser):
 
 
 def _capture_solve_with_criteria(
-    spec_str: str, use_fresh: bool = False
+    inputs: Tuple[str, bool]
 ) -> Tuple[str, Optional[Dict], Optional[str], Optional[str]]:
     """
     Solve a single spec and capture optimization criteria and DAG.
     Returns (spec_str, criteria_data, dag_output, error_message)
     """
+    spec_str, use_fresh = inputs
     try:
         specs = spack.cmd.parse_specs(spec_str)
         if len(specs) != 1:
@@ -221,43 +222,42 @@ def run(args):
     results = []
     errors = []
 
-    # Use ThreadPoolExecutor for parallel execution
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
-        # Submit all tasks
-        future_to_spec = {
-            executor.submit(_capture_solve_with_criteria, spec_str, use_fresh): spec_str
-            for spec_str in spec_strs
-        }
+    # Prepare inputs for parallel execution
+    inputs = [(spec_str, use_fresh) for spec_str in spec_strs]
 
-        # Process completed tasks
-        for idx, future in enumerate(
-            concurrent.futures.as_completed(future_to_spec), 1
-        ):
-            spec_str, criteria_data, dag_output, error = future.result()
+    # Use spack's parallel execution
+    idx = 0
+    for output in spack.util.parallel.imap_unordered(
+        _capture_solve_with_criteria,
+        inputs,
+        processes=args.jobs,
+    ):
+        idx += 1
+        spec_str, criteria_data, dag_output, error = output
 
-            if error:
-                errors.append({"spec": spec_str, "error": error})
-                tty.warn(f"[{idx}/{len(spec_strs)}] Failed: {spec_str} - {error}")
-            else:
-                results.append(criteria_data)
+        if error:
+            errors.append({"spec": spec_str, "error": error})
+            tty.warn(f"[{idx}/{len(spec_strs)}] Failed: {spec_str} - {error}")
+        else:
+            results.append(criteria_data)
 
-                # Save individual spec results
-                safe_name = spec_str.replace("/", "_").replace(" ", "_").replace("@", "-")
-                spec_dir = run_dir / safe_name
-                spec_dir.mkdir(exist_ok=True)
+            # Save individual spec results
+            safe_name = spec_str.replace("/", "_").replace(" ", "_").replace("@", "-")
+            spec_dir = run_dir / safe_name
+            spec_dir.mkdir(exist_ok=True)
 
-                # Save criteria as JSON
-                criteria_file = spec_dir / "criteria.json"
-                with open(criteria_file, "w") as f:
-                    json.dump(criteria_data, f, indent=2)
+            # Save criteria as JSON
+            criteria_file = spec_dir / "criteria.json"
+            with open(criteria_file, "w") as f:
+                json.dump(criteria_data, f, indent=2)
 
-                # Save DAG output as JSON
-                if dag_output:
-                    dag_file = spec_dir / "dag.json"
-                    with open(dag_file, "w") as f:
-                        json.dump(dag_output, f, indent=2)
+            # Save DAG output as JSON
+            if dag_output:
+                dag_file = spec_dir / "dag.json"
+                with open(dag_file, "w") as f:
+                    json.dump(dag_output, f, indent=2)
 
-                tty.msg(f"[{idx}/{len(spec_strs)}] {spec_str}")
+            tty.msg(f"[{idx}/{len(spec_strs)}] {spec_str}")
 
     # Save summary
     summary = {
@@ -504,8 +504,12 @@ def show(args):
         with open(criteria_file) as f:
             criteria_data = json.load(f)
 
+        if not criteria_data:
+            tty.die("Criteria file is empty or invalid")
+
         color.cprint(f"@*{{Spec: {args.spec}}}")
-        color.cprint(f"@*{{Models considered:}} {criteria_data['nmodels']}")
+        if "nmodels" in criteria_data:
+            color.cprint(f"@*{{Models considered:}} {criteria_data['nmodels']}")
         print()
 
         # Show optimization criteria using the same format as spack solve
