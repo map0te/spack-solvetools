@@ -580,39 +580,62 @@ def _compare_spec_details(spec_str, before_dag, after_dag):
         "compiler_changes": [],
     }
 
-    # Get all package names from both DAGs
-    before_packages = set(before_dag.keys())
-    after_packages = set(after_dag.keys())
+    # Extract nodes from the DAG structure
+    # DAG structure: {package_name: {spec: {nodes: [...]}}}
+    before_nodes = {}
+    after_nodes = {}
+
+    for pkg_name, pkg_data in before_dag.items():
+        if "spec" in pkg_data and "nodes" in pkg_data["spec"]:
+            for node in pkg_data["spec"]["nodes"]:
+                node_name = node.get("name")
+                if node_name:
+                    before_nodes[node_name] = node
+
+    for pkg_name, pkg_data in after_dag.items():
+        if "spec" in pkg_data and "nodes" in pkg_data["spec"]:
+            for node in pkg_data["spec"]["nodes"]:
+                node_name = node.get("name")
+                if node_name:
+                    after_nodes[node_name] = node
+
+    # Get all package names
+    before_packages = set(before_nodes.keys())
+    after_packages = set(after_nodes.keys())
 
     # Find added and removed dependencies
     added = after_packages - before_packages
     removed = before_packages - after_packages
 
-    for pkg in added:
-        pkg_spec = after_dag[pkg]["spec"]
-        differences["added_deps"].append(pkg_spec)
+    for pkg in sorted(added):
+        node = after_nodes[pkg]
+        version = node.get("version", "unknown")
+        differences["added_deps"].append(f"{pkg}@{version}")
 
-    for pkg in removed:
-        pkg_spec = before_dag[pkg]["spec"]
-        differences["removed_deps"].append(pkg_spec)
+    for pkg in sorted(removed):
+        node = before_nodes[pkg]
+        version = node.get("version", "unknown")
+        differences["removed_deps"].append(f"{pkg}@{version}")
 
     # Compare common packages for version/variant/compiler changes
     common_packages = before_packages & after_packages
-    for pkg in common_packages:
-        before_spec = before_dag[pkg]
-        after_spec = after_dag[pkg]
+    for pkg in sorted(common_packages):
+        before_node = before_nodes[pkg]
+        after_node = after_nodes[pkg]
 
         # Check version changes
-        if before_spec.get("version") != after_spec.get("version"):
+        before_version = before_node.get("version")
+        after_version = after_node.get("version")
+        if before_version != after_version:
             differences["version_changes"].append({
                 "package": pkg,
-                "before": before_spec.get("version", "unknown"),
-                "after": after_spec.get("version", "unknown"),
+                "before": before_version or "unknown",
+                "after": after_version or "unknown",
             })
 
         # Check variant changes
-        before_variants = before_spec.get("parameters", {})
-        after_variants = after_spec.get("parameters", {})
+        before_variants = before_node.get("parameters", {})
+        after_variants = after_node.get("parameters", {})
         if before_variants != after_variants:
             differences["variant_changes"].append({
                 "package": pkg,
@@ -621,13 +644,17 @@ def _compare_spec_details(spec_str, before_dag, after_dag):
             })
 
         # Check compiler changes
-        before_compiler = before_spec.get("compiler", {})
-        after_compiler = after_spec.get("compiler", {})
+        before_compiler = before_node.get("compiler", {})
+        after_compiler = after_node.get("compiler", {})
         if before_compiler != after_compiler:
+            before_name = before_compiler.get("name", "unknown")
+            before_ver = before_compiler.get("version", "unknown")
+            after_name = after_compiler.get("name", "unknown")
+            after_ver = after_compiler.get("version", "unknown")
             differences["compiler_changes"].append({
                 "package": pkg,
-                "before": f"{before_compiler.get('name', 'unknown')}@{before_compiler.get('version', 'unknown')}",
-                "after": f"{after_compiler.get('name', 'unknown')}@{after_compiler.get('version', 'unknown')}",
+                "before": f"{before_name}@{before_ver}",
+                "after": f"{after_name}@{after_ver}",
             })
 
     return differences
