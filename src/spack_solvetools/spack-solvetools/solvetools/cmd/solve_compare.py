@@ -731,14 +731,14 @@ def diff(args):
             has_changes = True
             color.cprint("@*{Added Dependencies:}")
             for dep in diff_details["added_deps"]:
-                color.cprint(f"  @g{{+}} {dep}")
+                color.cprint(f"  @g{{+ {dep}}}")
             print()
 
         if diff_details["removed_deps"]:
             has_changes = True
             color.cprint("@*{Removed Dependencies:}")
             for dep in diff_details["removed_deps"]:
-                color.cprint(f"  @r{{-}} {dep}")
+                color.cprint(f"  @r{{- {dep}}}")
             print()
 
         if diff_details["compiler_changes"]:
