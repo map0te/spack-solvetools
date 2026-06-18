@@ -89,6 +89,14 @@ def setup_parser(subparser: argparse.ArgumentParser):
     )
     spack.cmd.spec.setup_parser(profile_parser)
 
+    # Solve-compare subcommand
+    from . import solve_compare
+    solve_compare_parser = sp.add_parser(
+        'solve-compare',
+        help='capture and compare solve optimization criteria and DAG output'
+    )
+    solve_compare.setup_parser(solve_compare_parser)
+
 
 # List-models implementation
 models = []
@@ -607,3 +615,6 @@ def solvetools(parser: argparse.ArgumentParser, args):
         list_models(args)
     elif args.solvetools_command == "profile":
         profile(args)
+    elif args.solvetools_command == "solve-compare":
+        from . import solve_compare
+        solve_compare.solve_compare(parser, args)
