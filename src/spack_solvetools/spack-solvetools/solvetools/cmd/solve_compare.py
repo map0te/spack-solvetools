@@ -92,6 +92,11 @@ def setup_parser(subparser: argparse.ArgumentParser):
         help="output file for diff (default: stdout)",
         default=None,
     )
+    diff_parser.add_argument(
+        "--spec",
+        help="show detailed comparison for this specific spec",
+        default=None,
+    )
 
     # Show subcommand
     show_parser = sp.add_parser("show", help="show results from a previous run")
@@ -565,6 +570,69 @@ def show(args):
                 print(f"  \033[31mFAILED\033[0m  {spec_str}")
 
 
+def _compare_spec_details(spec_str, before_dag, after_dag):
+    """Compare two DAG dictionaries and return detailed differences"""
+    differences = {
+        "version_changes": [],
+        "added_deps": [],
+        "removed_deps": [],
+        "variant_changes": [],
+        "compiler_changes": [],
+    }
+
+    # Get all package names from both DAGs
+    before_packages = set(before_dag.keys())
+    after_packages = set(after_dag.keys())
+
+    # Find added and removed dependencies
+    added = after_packages - before_packages
+    removed = before_packages - after_packages
+
+    for pkg in added:
+        pkg_spec = after_dag[pkg]["spec"]
+        differences["added_deps"].append(pkg_spec)
+
+    for pkg in removed:
+        pkg_spec = before_dag[pkg]["spec"]
+        differences["removed_deps"].append(pkg_spec)
+
+    # Compare common packages for version/variant/compiler changes
+    common_packages = before_packages & after_packages
+    for pkg in common_packages:
+        before_spec = before_dag[pkg]
+        after_spec = after_dag[pkg]
+
+        # Check version changes
+        if before_spec.get("version") != after_spec.get("version"):
+            differences["version_changes"].append({
+                "package": pkg,
+                "before": before_spec.get("version", "unknown"),
+                "after": after_spec.get("version", "unknown"),
+            })
+
+        # Check variant changes
+        before_variants = before_spec.get("parameters", {})
+        after_variants = after_spec.get("parameters", {})
+        if before_variants != after_variants:
+            differences["variant_changes"].append({
+                "package": pkg,
+                "before": before_variants,
+                "after": after_variants,
+            })
+
+        # Check compiler changes
+        before_compiler = before_spec.get("compiler", {})
+        after_compiler = after_spec.get("compiler", {})
+        if before_compiler != after_compiler:
+            differences["compiler_changes"].append({
+                "package": pkg,
+                "before": f"{before_compiler.get('name', 'unknown')}@{before_compiler.get('version', 'unknown')}",
+                "after": f"{after_compiler.get('name', 'unknown')}@{after_compiler.get('version', 'unknown')}",
+            })
+
+    return differences
+
+
 def diff(args):
     """Compare DAGs between two runs and show which specs differ"""
     before_dir = pathlib.Path(args.before)
@@ -589,18 +657,91 @@ def diff(args):
     with open(after_summary_file) as f:
         after_summary = json.load(f)
 
-    # Setup output
-    if args.output:
-        output_file = open(args.output, "w")
-        out = output_file
-    else:
-        out = sys.stdout
+    # If --spec is provided, show detailed comparison for that spec only
+    if args.spec:
+        safe_name = args.spec.replace("/", "_").replace(" ", "_").replace("@", "-")
+        before_dag_file = before_dir / safe_name / "dag.json"
+        after_dag_file = after_dir / safe_name / "dag.json"
 
-    def write(msg):
-        out.write(msg + "\n")
+        if not before_dag_file.exists():
+            tty.die(f"Spec not found in before run: {args.spec}")
+        if not after_dag_file.exists():
+            tty.die(f"Spec not found in after run: {args.spec}")
 
-    write(f"# DAG Comparison: {before_summary['label']} vs {after_summary['label']}")
-    write("")
+        try:
+            with open(before_dag_file) as f:
+                before_dag = json.load(f)
+            with open(after_dag_file) as f:
+                after_dag = json.load(f)
+        except (json.JSONDecodeError, ValueError) as e:
+            tty.die(f"Failed to load DAG files: {e}")
+
+        # Check if they're identical
+        if before_dag == after_dag:
+            color.cprint(f"\n@*{{Spec:}} {args.spec}")
+            color.cprint("@g{DAGs are identical - no changes}")
+            return
+
+        # Get detailed differences
+        diff_details = _compare_spec_details(args.spec, before_dag, after_dag)
+
+        # Display results
+        print()
+        color.cprint(f"@*{{Spec:}} {args.spec}")
+        color.cprint(f"@*{{Comparison:}} {before_summary['label']} vs {after_summary['label']}")
+        print()
+
+        has_changes = False
+
+        if diff_details["version_changes"]:
+            has_changes = True
+            color.cprint("@*{Version Changes:}")
+            for change in diff_details["version_changes"]:
+                color.cprint(f"  @y{{{change['package']}}}: {change['before']} -> {change['after']}")
+            print()
+
+        if diff_details["added_deps"]:
+            has_changes = True
+            color.cprint("@*{Added Dependencies:}")
+            for dep in diff_details["added_deps"]:
+                color.cprint(f"  @g{{+}} {dep}")
+            print()
+
+        if diff_details["removed_deps"]:
+            has_changes = True
+            color.cprint("@*{Removed Dependencies:}")
+            for dep in diff_details["removed_deps"]:
+                color.cprint(f"  @r{{-}} {dep}")
+            print()
+
+        if diff_details["compiler_changes"]:
+            has_changes = True
+            color.cprint("@*{Compiler Changes:}")
+            for change in diff_details["compiler_changes"]:
+                color.cprint(f"  @y{{{change['package']}}}: {change['before']} -> {change['after']}")
+            print()
+
+        if diff_details["variant_changes"]:
+            has_changes = True
+            color.cprint("@*{Variant Changes:}")
+            for change in diff_details["variant_changes"]:
+                color.cprint(f"  @y{{{change['package']}}}:")
+                # Show what changed in variants
+                before_vars = change["before"]
+                after_vars = change["after"]
+                all_keys = set(before_vars.keys()) | set(after_vars.keys())
+                for key in sorted(all_keys):
+                    before_val = before_vars.get(key, "<not set>")
+                    after_val = after_vars.get(key, "<not set>")
+                    if before_val != after_val:
+                        color.cprint(f"    {key}: {before_val} -> {after_val}")
+            print()
+
+        if not has_changes:
+            color.cprint("@y{DAGs differ but couldn't identify specific changes}")
+            color.cprint("(This may indicate hash or structural differences)")
+
+        return
 
     # Find common specs
     before_specs = set(before_summary["specs"])
@@ -608,11 +749,13 @@ def diff(args):
     common_specs = before_specs & after_specs
 
     if not common_specs:
-        write("No common specs found between the two runs")
+        if args.output:
+            with open(args.output, "w") as f:
+                f.write("No common specs found between the two runs\n")
+            tty.msg(f"Diff saved to: {args.output}")
+        else:
+            tty.msg("No common specs found between the two runs")
         return
-
-    write(f"Comparing {len(common_specs)} common specs")
-    write("")
 
     # Compare DAGs
     identical = []
@@ -645,30 +788,35 @@ def diff(args):
             different.append(spec_str)
 
     # Report results
-    write("## Summary")
-    write("")
-    write(f"Total specs compared: {len(common_specs)}")
-    write(f"Identical DAGs:       {len(identical)}")
-    write(f"Different DAGs:       {len(different)}")
-    write(f"Missing data:         {len(missing_data)}")
-    write("")
-
-    if different:
-        write("## Specs with Different DAGs")
-        write("")
-        for spec_str in different:
-            write(f"  - {spec_str}")
-        write("")
-
-    if missing_data:
-        write("## Specs with Missing Data")
-        write("")
-        for spec_str in missing_data:
-            write(f"  - {spec_str}")
-        write("")
-
     if args.output:
-        output_file.close()
+        # Write plain text to file
+        with open(args.output, "w") as f:
+            f.write(f"# DAG Comparison: {before_summary['label']} vs {after_summary['label']}\n")
+            f.write("\n")
+            f.write(f"Comparing {len(common_specs)} common specs\n")
+            f.write("\n")
+            f.write("## Summary\n")
+            f.write("\n")
+            f.write(f"Total specs compared: {len(common_specs)}\n")
+            f.write(f"Identical DAGs:       {len(identical)}\n")
+            f.write(f"Different DAGs:       {len(different)}\n")
+            f.write(f"Missing data:         {len(missing_data)}\n")
+            f.write("\n")
+
+            if different:
+                f.write("## Specs with Different DAGs\n")
+                f.write("\n")
+                for spec_str in different:
+                    f.write(f"  - {spec_str}\n")
+                f.write("\n")
+
+            if missing_data:
+                f.write("## Specs with Missing Data\n")
+                f.write("\n")
+                for spec_str in missing_data:
+                    f.write(f"  - {spec_str}\n")
+                f.write("\n")
+
         tty.msg(f"Diff saved to: {args.output}")
     else:
         # Colorized output for terminal
