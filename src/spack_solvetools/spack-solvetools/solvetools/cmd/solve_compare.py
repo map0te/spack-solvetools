@@ -571,7 +571,10 @@ def show(args):
 
 
 def _compare_spec_details(spec_str, before_dag, after_dag):
-    """Compare two DAG dictionaries and return detailed differences"""
+    """Compare two DAG dictionaries and return detailed differences
+
+    Handles multiple versions of the same package in the DAG.
+    """
     differences = {
         "version_changes": [],
         "added_deps": [],
@@ -580,82 +583,111 @@ def _compare_spec_details(spec_str, before_dag, after_dag):
         "compiler_changes": [],
     }
 
-    # Extract nodes from the DAG structure
+    # Extract nodes from the DAG structure, grouped by package name
     # DAG structure: {package_name: {spec: {nodes: [...]}}}
-    before_nodes = {}
-    after_nodes = {}
+    # Use lists to handle multiple versions of the same package
+    from collections import defaultdict
+    before_nodes_by_pkg = defaultdict(list)
+    after_nodes_by_pkg = defaultdict(list)
 
     for pkg_name, pkg_data in before_dag.items():
         if "spec" in pkg_data and "nodes" in pkg_data["spec"]:
             for node in pkg_data["spec"]["nodes"]:
                 node_name = node.get("name")
                 if node_name:
-                    before_nodes[node_name] = node
+                    before_nodes_by_pkg[node_name].append(node)
 
     for pkg_name, pkg_data in after_dag.items():
         if "spec" in pkg_data and "nodes" in pkg_data["spec"]:
             for node in pkg_data["spec"]["nodes"]:
                 node_name = node.get("name")
                 if node_name:
-                    after_nodes[node_name] = node
+                    after_nodes_by_pkg[node_name].append(node)
 
     # Get all package names
-    before_packages = set(before_nodes.keys())
-    after_packages = set(after_nodes.keys())
+    before_packages = set(before_nodes_by_pkg.keys())
+    after_packages = set(after_nodes_by_pkg.keys())
 
-    # Find added and removed dependencies
-    added = after_packages - before_packages
-    removed = before_packages - after_packages
+    # Find packages that were completely added or removed
+    added_packages = after_packages - before_packages
+    removed_packages = before_packages - after_packages
 
-    for pkg in sorted(added):
-        node = after_nodes[pkg]
-        version = node.get("version", "unknown")
-        differences["added_deps"].append(f"{pkg}@{version}")
+    for pkg in sorted(added_packages):
+        for node in after_nodes_by_pkg[pkg]:
+            version = node.get("version", "unknown")
+            hash_str = node.get("hash", "")[:7] if node.get("hash") else ""
+            hash_suffix = f" [{hash_str}]" if hash_str else ""
+            differences["added_deps"].append(f"{pkg}@{version}{hash_suffix}")
 
-    for pkg in sorted(removed):
-        node = before_nodes[pkg]
-        version = node.get("version", "unknown")
-        differences["removed_deps"].append(f"{pkg}@{version}")
+    for pkg in sorted(removed_packages):
+        for node in before_nodes_by_pkg[pkg]:
+            version = node.get("version", "unknown")
+            hash_str = node.get("hash", "")[:7] if node.get("hash") else ""
+            hash_suffix = f" [{hash_str}]" if hash_str else ""
+            differences["removed_deps"].append(f"{pkg}@{version}{hash_suffix}")
 
-    # Compare common packages for version/variant/compiler changes
+    # Compare common packages (may have multiple versions)
     common_packages = before_packages & after_packages
     for pkg in sorted(common_packages):
-        before_node = before_nodes[pkg]
-        after_node = after_nodes[pkg]
+        before_nodes = before_nodes_by_pkg[pkg]
+        after_nodes = after_nodes_by_pkg[pkg]
 
-        # Check version changes
-        before_version = before_node.get("version")
-        after_version = after_node.get("version")
-        if before_version != after_version:
-            differences["version_changes"].append({
-                "package": pkg,
-                "before": before_version or "unknown",
-                "after": after_version or "unknown",
-            })
+        # Create version sets for comparison
+        before_versions = {node.get("version") for node in before_nodes}
+        after_versions = {node.get("version") for node in after_nodes}
 
-        # Check variant changes
-        before_variants = before_node.get("parameters", {})
-        after_variants = after_node.get("parameters", {})
-        if before_variants != after_variants:
-            differences["variant_changes"].append({
-                "package": pkg,
-                "before": before_variants,
-                "after": after_variants,
-            })
+        # Check for version changes
+        if before_versions != after_versions:
+            added_versions = after_versions - before_versions
+            removed_versions = before_versions - after_versions
 
-        # Check compiler changes
-        before_compiler = before_node.get("compiler", {})
-        after_compiler = after_node.get("compiler", {})
-        if before_compiler != after_compiler:
-            before_name = before_compiler.get("name", "unknown")
-            before_ver = before_compiler.get("version", "unknown")
-            after_name = after_compiler.get("name", "unknown")
-            after_ver = after_compiler.get("version", "unknown")
-            differences["compiler_changes"].append({
-                "package": pkg,
-                "before": f"{before_name}@{before_ver}",
-                "after": f"{after_name}@{after_ver}",
-            })
+            if added_versions or removed_versions:
+                differences["version_changes"].append({
+                    "package": pkg,
+                    "before": sorted(before_versions),
+                    "after": sorted(after_versions),
+                    "added_versions": sorted(added_versions),
+                    "removed_versions": sorted(removed_versions),
+                })
+
+        # Match nodes by hash for detailed comparison (variants, compiler)
+        before_by_hash = {node.get("hash"): node for node in before_nodes if node.get("hash")}
+        after_by_hash = {node.get("hash"): node for node in after_nodes if node.get("hash")}
+
+        common_hashes = set(before_by_hash.keys()) & set(after_by_hash.keys())
+
+        # Check variant and compiler changes for matching hashes
+        for hash_val in common_hashes:
+            before_node = before_by_hash[hash_val]
+            after_node = after_by_hash[hash_val]
+
+            # Check variant changes
+            before_variants = before_node.get("parameters", {})
+            after_variants = after_node.get("parameters", {})
+            if before_variants != after_variants:
+                version = before_node.get("version", "unknown")
+                differences["variant_changes"].append({
+                    "package": f"{pkg}@{version}",
+                    "hash": hash_val[:7],
+                    "before": before_variants,
+                    "after": after_variants,
+                })
+
+            # Check compiler changes
+            before_compiler = before_node.get("compiler", {})
+            after_compiler = after_node.get("compiler", {})
+            if before_compiler != after_compiler:
+                version = before_node.get("version", "unknown")
+                before_name = before_compiler.get("name", "unknown")
+                before_ver = before_compiler.get("version", "unknown")
+                after_name = after_compiler.get("name", "unknown")
+                after_ver = after_compiler.get("version", "unknown")
+                differences["compiler_changes"].append({
+                    "package": f"{pkg}@{version}",
+                    "hash": hash_val[:7],
+                    "before": f"{before_name}@{before_ver}",
+                    "after": f"{after_name}@{after_ver}",
+                })
 
     return differences
 
@@ -724,7 +756,20 @@ def diff(args):
             has_changes = True
             color.cprint("@*{Version Changes:}")
             for change in diff_details["version_changes"]:
-                color.cprint(f"  @y{{{change['package']}}}: {change['before']} -> {change['after']}")
+                pkg = change['package']
+                before_vers = ", ".join(str(v) for v in change['before'])
+                after_vers = ", ".join(str(v) for v in change['after'])
+
+                if change.get('removed_versions'):
+                    removed = ", ".join(str(v) for v in change['removed_versions'])
+                    color.cprint(f"  @y{{{pkg}}}: removed {removed}")
+                if change.get('added_versions'):
+                    added = ", ".join(str(v) for v in change['added_versions'])
+                    color.cprint(f"  @y{{{pkg}}}: added {added}")
+
+                # Show full before/after if it's a complete replacement
+                if not change.get('added_versions') and not change.get('removed_versions'):
+                    color.cprint(f"  @y{{{pkg}}}: {before_vers} -> {after_vers}")
             print()
 
         if diff_details["added_deps"]:
@@ -745,14 +790,16 @@ def diff(args):
             has_changes = True
             color.cprint("@*{Compiler Changes:}")
             for change in diff_details["compiler_changes"]:
-                color.cprint(f"  @y{{{change['package']}}}: {change['before']} -> {change['after']}")
+                hash_info = f" [{change['hash']}]" if change.get('hash') else ""
+                color.cprint(f"  @y{{{change['package']}{hash_info}}}: {change['before']} -> {change['after']}")
             print()
 
         if diff_details["variant_changes"]:
             has_changes = True
             color.cprint("@*{Variant Changes:}")
             for change in diff_details["variant_changes"]:
-                color.cprint(f"  @y{{{change['package']}}}:")
+                hash_info = f" [{change['hash']}]" if change.get('hash') else ""
+                color.cprint(f"  @y{{{change['package']}{hash_info}}}:")
                 # Show what changed in variants
                 before_vars = change["before"]
                 after_vars = change["after"]
