@@ -650,44 +650,76 @@ def _compare_spec_details(spec_str, before_dag, after_dag):
                     "removed_versions": sorted(removed_versions),
                 })
 
-        # Match nodes by hash for detailed comparison (variants, compiler)
-        before_by_hash = {node.get("hash"): node for node in before_nodes if node.get("hash")}
-        after_by_hash = {node.get("hash"): node for node in after_nodes if node.get("hash")}
+        # Match nodes by (package, version) for detailed comparison
+        # Create a map of version -> list of nodes for each
+        before_by_version = defaultdict(list)
+        after_by_version = defaultdict(list)
 
-        common_hashes = set(before_by_hash.keys()) & set(after_by_hash.keys())
+        for node in before_nodes:
+            version = node.get("version")
+            if version:
+                before_by_version[version].append(node)
 
-        # Check variant and compiler changes for matching hashes
-        for hash_val in common_hashes:
-            before_node = before_by_hash[hash_val]
-            after_node = after_by_hash[hash_val]
+        for node in after_nodes:
+            version = node.get("version")
+            if version:
+                after_by_version[version].append(node)
 
-            # Check variant changes
-            before_variants = before_node.get("parameters", {})
-            after_variants = after_node.get("parameters", {})
-            if before_variants != after_variants:
-                version = before_node.get("version", "unknown")
-                differences["variant_changes"].append({
-                    "package": f"{pkg}@{version}",
-                    "hash": hash_val[:7],
-                    "before": before_variants,
-                    "after": after_variants,
-                })
+        # Compare nodes with the same version
+        common_versions = set(before_by_version.keys()) & set(after_by_version.keys())
+        for version in common_versions:
+            before_ver_nodes = before_by_version[version]
+            after_ver_nodes = after_by_version[version]
 
-            # Check compiler changes
-            before_compiler = before_node.get("compiler", {})
-            after_compiler = after_node.get("compiler", {})
-            if before_compiler != after_compiler:
-                version = before_node.get("version", "unknown")
-                before_name = before_compiler.get("name", "unknown")
-                before_ver = before_compiler.get("version", "unknown")
-                after_name = after_compiler.get("name", "unknown")
-                after_ver = after_compiler.get("version", "unknown")
-                differences["compiler_changes"].append({
-                    "package": f"{pkg}@{version}",
-                    "hash": hash_val[:7],
-                    "before": f"{before_name}@{before_ver}",
-                    "after": f"{after_name}@{after_ver}",
-                })
+            # If there's exactly one node of this version in each DAG, compare directly
+            if len(before_ver_nodes) == 1 and len(after_ver_nodes) == 1:
+                before_node = before_ver_nodes[0]
+                after_node = after_ver_nodes[0]
+
+                # Check variant changes
+                before_variants = before_node.get("parameters", {})
+                after_variants = after_node.get("parameters", {})
+                if before_variants != after_variants:
+                    before_hash = before_node.get("hash", "")[:7]
+                    after_hash = after_node.get("hash", "")[:7]
+                    differences["variant_changes"].append({
+                        "package": f"{pkg}@{version}",
+                        "before_hash": before_hash,
+                        "after_hash": after_hash,
+                        "before": before_variants,
+                        "after": after_variants,
+                    })
+
+                # Check compiler changes
+                before_compiler = before_node.get("compiler", {})
+                after_compiler = after_node.get("compiler", {})
+                if before_compiler != after_compiler:
+                    before_hash = before_node.get("hash", "")[:7]
+                    after_hash = after_node.get("hash", "")[:7]
+                    before_name = before_compiler.get("name", "unknown")
+                    before_ver = before_compiler.get("version", "unknown")
+                    after_name = after_compiler.get("name", "unknown")
+                    after_ver = after_compiler.get("version", "unknown")
+                    differences["compiler_changes"].append({
+                        "package": f"{pkg}@{version}",
+                        "before_hash": before_hash,
+                        "after_hash": after_hash,
+                        "before": f"{before_name}@{before_ver}",
+                        "after": f"{after_name}@{after_ver}",
+                    })
+            else:
+                # Multiple nodes with same version - try to match by hash
+                before_by_hash = {node.get("hash"): node for node in before_ver_nodes if node.get("hash")}
+                after_by_hash = {node.get("hash"): node for node in after_ver_nodes if node.get("hash")}
+
+                common_hashes = set(before_by_hash.keys()) & set(after_by_hash.keys())
+
+                # For matching hashes (identical nodes), skip comparison
+                # For non-matching, this indicates structural changes we can't easily represent
+                if len(before_by_hash) != len(after_by_hash) or len(common_hashes) != len(before_by_hash):
+                    # Some nodes were added/removed with this version
+                    # This is captured in the version changes already
+                    pass
 
     return differences
 
@@ -790,7 +822,14 @@ def diff(args):
             has_changes = True
             color.cprint("@*{Compiler Changes:}")
             for change in diff_details["compiler_changes"]:
-                hash_info = f" [{change['hash']}]" if change.get('hash') else ""
+                before_hash = change.get('before_hash', '')
+                after_hash = change.get('after_hash', '')
+                if before_hash and after_hash and before_hash != after_hash:
+                    hash_info = f" [{before_hash} -> {after_hash}]"
+                elif before_hash or after_hash:
+                    hash_info = f" [{before_hash or after_hash}]"
+                else:
+                    hash_info = ""
                 color.cprint(f"  @y{{{change['package']}{hash_info}}}: {change['before']} -> {change['after']}")
             print()
 
@@ -798,7 +837,14 @@ def diff(args):
             has_changes = True
             color.cprint("@*{Variant Changes:}")
             for change in diff_details["variant_changes"]:
-                hash_info = f" [{change['hash']}]" if change.get('hash') else ""
+                before_hash = change.get('before_hash', '')
+                after_hash = change.get('after_hash', '')
+                if before_hash and after_hash and before_hash != after_hash:
+                    hash_info = f" [{before_hash} -> {after_hash}]"
+                elif before_hash or after_hash:
+                    hash_info = f" [{before_hash or after_hash}]"
+                else:
+                    hash_info = ""
                 color.cprint(f"  @y{{{change['package']}{hash_info}}}:")
                 # Show what changed in variants
                 before_vars = change["before"]
