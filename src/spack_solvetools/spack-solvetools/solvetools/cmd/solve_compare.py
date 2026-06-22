@@ -98,6 +98,28 @@ def setup_parser(subparser: argparse.ArgumentParser):
         default=None,
     )
 
+    # Unix-diff subcommand
+    unix_diff_parser = sp.add_parser(
+        "unix-diff", help="run unix diff on DAG tree output for a spec"
+    )
+    unix_diff_parser.add_argument(
+        "before",
+        help="directory from first run",
+    )
+    unix_diff_parser.add_argument(
+        "after",
+        help="directory from second run",
+    )
+    unix_diff_parser.add_argument(
+        "spec",
+        help="spec to compare",
+    )
+    unix_diff_parser.add_argument(
+        "--color",
+        help="use colored diff output",
+        action="store_true",
+    )
+
     # Show subcommand
     show_parser = sp.add_parser("show", help="show results from a previous run")
     show_parser.add_argument(
@@ -970,6 +992,92 @@ def diff(args):
             print()
 
 
+def unix_diff(args):
+    """Run unix diff on DAG tree output for a spec"""
+    import subprocess
+    import tempfile
+
+    before_dir = pathlib.Path(args.before)
+    after_dir = pathlib.Path(args.after)
+
+    if not before_dir.exists():
+        tty.die(f"Before directory not found: {args.before}")
+    if not after_dir.exists():
+        tty.die(f"After directory not found: {args.after}")
+
+    # Load DAG files
+    safe_name = args.spec.replace("/", "_").replace(" ", "_").replace("@", "-")
+    before_dag_file = before_dir / safe_name / "dag.json"
+    after_dag_file = after_dir / safe_name / "dag.json"
+
+    if not before_dag_file.exists():
+        tty.die(f"Spec not found in before run: {args.spec}")
+    if not after_dag_file.exists():
+        tty.die(f"Spec not found in after run: {args.spec}")
+
+    try:
+        with open(before_dag_file) as f:
+            before_dag = json.load(f)
+        with open(after_dag_file) as f:
+            after_dag = json.load(f)
+    except (json.JSONDecodeError, ValueError) as e:
+        tty.die(f"Failed to load DAG files: {e}")
+
+    # Generate tree output for both DAGs
+    def dag_to_tree_text(dag_data):
+        specs = []
+        for spec_name, spec_dict in dag_data.items():
+            spec = spack.spec.Spec.from_dict(spec_dict)
+            specs.append(spec)
+
+        tree_output = spack.spec.tree(
+            specs,
+            color=False,
+            format=spack.spec.DISPLAY_FORMAT,
+            hashlen=7,
+            hashes=False,
+            status_fn=None,
+            show_types=False,
+        )
+        return tree_output
+
+    before_tree = dag_to_tree_text(before_dag)
+    after_tree = dag_to_tree_text(after_dag)
+
+    # Write to temp files
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f1:
+        f1.write(before_tree)
+        before_file = f1.name
+
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f2:
+        f2.write(after_tree)
+        after_file = f2.name
+
+    try:
+        # Run diff command
+        diff_cmd = ["diff", "-u", before_file, after_file]
+
+        if args.color:
+            # Use colordiff if available, otherwise fall back to diff with color
+            try:
+                subprocess.run(["colordiff", "--version"], capture_output=True, check=True)
+                diff_cmd = ["colordiff", "-u", before_file, after_file]
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                # Try diff with --color
+                diff_cmd = ["diff", "-u", "--color=always", before_file, after_file]
+
+        result = subprocess.run(diff_cmd, capture_output=False)
+
+        # diff returns 0 if files are identical, 1 if different, >1 on error
+        if result.returncode > 1:
+            tty.die("diff command failed")
+    finally:
+        # Clean up temp files
+        import os
+        os.unlink(before_file)
+        os.unlink(after_file)
+
+
 def solve_compare(parser: argparse.ArgumentParser, args):
     if not args.solve_compare_command:
         parser.print_help()
@@ -981,3 +1089,5 @@ def solve_compare(parser: argparse.ArgumentParser, args):
         show(args)
     elif args.solve_compare_command == "diff":
         diff(args)
+    elif args.solve_compare_command == "unix-diff":
+        unix_diff(args)
